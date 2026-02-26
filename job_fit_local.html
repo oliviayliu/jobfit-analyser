@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Job Fit Analyser</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #f9f7f4; font-family: Georgia, serif; color: #1a1a1a; }
+  ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: #ddd; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const EMPTY_PROFILE = { name:"", cv:"", interests:"", dislikes:"", goals:"", constraints:"" };
+
+const ONBOARDING_STEPS = [
+  { key:"name", label:"What's your name?", hint:"Just your first name is fine", placeholder:"e.g. Sarah", type:"input", required:true },
+  { key:"cv", label:"Paste your CV or work history", hint:"Include job titles, companies, dates, and key achievements. The more detail, the better the analysis.", placeholder:"e.g.\nSenior Product Manager | Spotify | 2022–present\n- Led growth of premium subscription...\n\nMBA | INSEAD | 2020", type:"textarea", required:true },
+  { key:"interests", label:"What kind of work energises you?", hint:"Be honest — this shapes every assessment", placeholder:"e.g.\n- Working directly with customers\n- Solving ambiguous strategic problems\n- Building and leading teams", type:"textarea", required:true },
+  { key:"dislikes", label:"What kind of work drains you?", hint:"Helps filter out roles that look good on paper but would make you miserable", placeholder:"e.g.\n- Purely administrative or process-heavy work\n- Highly technical coding roles\n- Extreme high-pressure sales environments", type:"textarea", required:false },
+  { key:"goals", label:"What are your long-term career goals?", hint:"Where do you want to be in 3–5 years?", placeholder:"e.g.\n- Move into a leadership role at a mission-driven company\n- Build expertise at the intersection of tech and policy\n- Work internationally", type:"textarea", required:true },
+  { key:"constraints", label:"Any constraints or red flags to watch for?", hint:"Visa limitations, sectors you can't work in, dealbreakers", placeholder:"e.g.\n- Need visa sponsorship for UK roles\n- Cannot work in defence industries\n- Need remote-friendly role", type:"textarea", required:false },
+];
+
+const INTERVIEW_STATUSES = ["Applied","Screening","Interview","Final Round","Offer","Rejected","Withdrawn"];
+const STATUS_COLORS = { "Applied":"#6366f1","Screening":"#8b5cf6","Interview":"#f59e0b","Final Round":"#3b82f6","Offer":"#10b981","Rejected":"#ef4444","Withdrawn":"#666" };
+
+function buildSystemPrompt(profile) {
+  return `You are a highly experienced career advisor helping ${profile.name||"a job seeker"}.
+CV / EXPERIENCE:\n${profile.cv}\nWHAT THEY ENJOY:\n${profile.interests}\nWHAT THEY DISLIKE:\n${profile.dislikes||"Not specified"}\nLONG-TERM GOALS:\n${profile.goals}\nCONSTRAINTS:\n${profile.constraints||"None specified"}\nBe honest, direct, specific. Never invent experience they don't have.`;
+}
+
+async function callClaude(prompt, profile, apiKey) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "x-api-key": apiKey,
+      "anthropic-version":"2023-06-01",
+      "anthropic-dangerous-direct-browser-access":"true"
+    },
+    body: JSON.stringify({
+      model:"claude-sonnet-4-20250514",
+      max_tokens:1000,
+      system: buildSystemPrompt(profile),
+      messages:[{ role:"user", content:prompt }]
+    })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n") || "";
+}
+
+function exportToWord(cv, title, name) {
+  const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office'><head><meta charset='utf-8'><style>body{font-family:Arial,sans-serif;font-size:11pt;margin:2cm}pre{font-family:Arial,sans-serif;white-space:pre-wrap;font-size:10.5pt;line-height:1.6}</style></head><body><pre>${cv}</pre></body></html>`;
+  const blob = new Blob([html],{type:"application/msword"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href=url; a.download=`${(name||"CV").replace(/\s+/g,"_")}_${title.replace(/\s+/g,"_")}.doc`; a.click(); URL.revokeObjectURL(url);
+}
+
+const parseField = (text,field) => text?.match(new RegExp(`${field}:\\s*([^\\n]+)`))?.[1]?.trim()||null;
+const parseScore = (text) => { const m=text?.match(/SCORE:\s*(\d+)/); return m?parseInt(m[1]):null; };
+const scoreColor = (s) => s>=75?"#10b981":s>=50?"#f59e0b":"#ef4444";
+
+function App() {
+  const [screen, setScreen] = React.useState("loading");
+  const [apiKey, setApiKey] = React.useState("");
+  const [apiKeyInput, setApiKeyInput] = React.useState("");
+  const [apiKeyError, setApiKeyError] = React.useState("");
+  const [onboardStep, setOnboardStep] = React.useState(0);
+  const [profile, setProfile] = React.useState(EMPTY_PROFILE);
+  const [profileDraft, setProfileDraft] = React.useState(EMPTY_PROFILE);
+  const [view, setView] = React.useState("analyze");
+  const [jobText, setJobText] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
+  const [loadingMsg, setLoadingMsg] = React.useState("");
+  const [results, setResults] = React.useState(null);
+  const [activeTab, setActiveTab] = React.useState("assessment");
+  const [history, setHistory] = React.useState([]);
+  const [error, setError] = React.useState(null);
+  const [profileSaved, setProfileSaved] = React.useState(false);
+
+  React.useEffect(() => {
+    const savedKey = localStorage.getItem("jfa_apikey");
+    const savedProfile = localStorage.getItem("jfa_profile");
+    const savedHistory = localStorage.getItem("jfa_history");
+    if (savedHistory) { try { setHistory(JSON.parse(savedHistory)); } catch(e){} }
+    if (savedKey) {
+      setApiKey(savedKey);
+      if (savedProfile) { try { const p=JSON.parse(savedProfile); setProfile(p); setProfileDraft(p); setScreen("app"); } catch(e){ setScreen("onboarding"); } }
+      else setScreen("onboarding");
+    } else {
+      setScreen("apikey");
+    }
+  }, []);
+
+  const saveHistory = (h) => { setHistory(h); localStorage.setItem("jfa_history", JSON.stringify(h)); };
+
+  const submitApiKey = async () => {
+    if (!apiKeyInput.trim().startsWith("sk-ant-")) {
+      setApiKeyError("That doesn't look like an Anthropic API key. It should start with sk-ant-");
+      return;
+    }
+    setApiKeyError("");
+    setApiKey(apiKeyInput.trim());
+    localStorage.setItem("jfa_apikey", apiKeyInput.trim());
+    setScreen("onboarding");
+  };
+
+  const completeOnboarding = () => {
+    setProfile(profileDraft);
+    localStorage.setItem("jfa_profile", JSON.stringify(profileDraft));
+    setScreen("app");
+  };
+
+  const saveProfile = () => {
+    setProfile(profileDraft);
+    localStorage.setItem("jfa_profile", JSON.stringify(profileDraft));
+    setProfileSaved(true);
+    setTimeout(() => setProfileSaved(false), 2000);
+  };
+
+  const analyze = async () => {
+    if (!jobText.trim()) return;
+    setLoading(true); setError(null); setResults(null);
+    try {
+      setLoadingMsg("📊 Assessing fit...");
+      const assessment = await callClaude(`Assess this job for ${profile.name||"this person"}. Be honest.
+
+JOB DESCRIPTION:
+${jobText}
+
+Respond in EXACTLY this format:
+SCORE: [0-100]
+VERDICT: [STRONG FIT / GOOD FIT / PARTIAL FIT / POOR FIT / NOT RECOMMENDED]
+ROLE_TITLE: [job title]
+COMPANY: [company name or Unknown]
+SUMMARY: [2-3 sentences]
+RED_FLAGS: [serious issues from their constraints, or "None"]
+MARKET_TREND: [2 sentences: growing or shrinking demand for this role in next 3 years?]
+STRENGTHS:
+- [point]
+- [point]
+- [point]
+GAPS:
+- [point]
+- [point]
+HONEST_ADVICE: [1-2 sentences frank advice]`, profile, apiKey);
+
+      const roleTitle = parseField(assessment,"ROLE_TITLE")||"Role";
+      const company = parseField(assessment,"COMPANY")||"Unknown";
+      const score = parseScore(assessment);
+      setResults({ assessment, jobDesc:jobText, roleTitle, company });
+      setActiveTab("assessment");
+      const entry = { id:Date.now(), date:new Date().toLocaleDateString("en-GB"), roleTitle, company, score, verdict:parseField(assessment,"VERDICT"), status:"Applied", jobDesc:jobText };
+      saveHistory([entry,...history].slice(0,50));
+    } catch(e) { setError("Error: " + (e.message||"Something went wrong. Check your API key.")); }
+    setLoading(false); setLoadingMsg("");
+  };
+
+  const generateCV = async () => {
+    setLoading(true); setLoadingMsg("📄 Writing tailored CV...");
+    try {
+      const cv = await callClaude(`Write a tailored CV for this person.\nJOB:\n${results.jobDesc}\n\nFormat: PROFILE, EXPERIENCE, EDUCATION, SKILLS\n- Role-specific profile statement\n- Reorder to highlight most relevant experience\n- Strong action verbs, quantified achievements\n- Do NOT invent experience\n- Concise (1 page equivalent)`, profile, apiKey);
+      setResults(r=>({...r,cv})); setActiveTab("cv");
+    } catch(e) { setError("Error generating CV."); }
+    setLoading(false); setLoadingMsg("");
+  };
+
+  const generateCover = async () => {
+    setLoading(true); setLoadingMsg("✉️ Writing cover letter...");
+    try {
+      const cover = await callClaude(`Write a compelling cover letter.\nJOB:\n${results.jobDesc}\n\n- Strong specific opening (not "I am writing to apply")\n- 2-3 most relevant experiences with specifics\n- Why this specific organisation\n- ~350 words, confident, no clichés`, profile, apiKey);
+      setResults(r=>({...r,cover})); setActiveTab("cover");
+    } catch(e) { setError("Error generating cover letter."); }
+    setLoading(false); setLoadingMsg("");
+  };
+
+  const generateLinkedIn = async () => {
+    setLoading(true); setLoadingMsg("💼 Drafting LinkedIn message...");
+    try {
+      const linkedin = await callClaude(`Write a 2-3 sentence LinkedIn outreach message.\nJOB:\n${results.jobDesc}\n\n- Don't ask for a job — ask for a conversation\n- Lead with their strongest credential\n- Mention something specific about the company\n- Human and confident, not templated`, profile, apiKey);
+      setResults(r=>({...r,linkedin})); setActiveTab("linkedin");
+    } catch(e) { setError("Error generating LinkedIn message."); }
+    setLoading(false); setLoadingMsg("");
+  };
+
+  const updateStatus = (id,status) => saveHistory(history.map(h=>h.id===id?{...h,status}:h));
+  const deleteItem = (id) => saveHistory(history.filter(h=>h.id!==id));
+
+  const score = parseScore(results?.assessment);
+  const verdict = parseField(results?.assessment,"VERDICT");
+  const redFlags = parseField(results?.assessment,"RED_FLAGS");
+  const marketTrend = parseField(results?.assessment,"MARKET_TREND");
+  const cleanAssessment = results?.assessment
+    ?.replace(/SCORE:.*\n/,"")?.replace(/VERDICT:.*\n/,"")
+    ?.replace(/ROLE_TITLE:.*\n/,"")?.replace(/COMPANY:.*\n/,"")
+    ?.replace(/RED_FLAGS:.*\n/,"")?.replace(/MARKET_TREND:.*\n/,"");
+
+  const C = {
+    page: { minHeight:"100vh", background:"#f9f7f4" },
+    center: { minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"24px", background:"#1a1a2e" },
+    bigCard: { background:"#fff", borderRadius:"16px", padding:"40px 44px", maxWidth:"520px", width:"100%", boxShadow:"0 20px 60px rgba(0,0,0,0.3)" },
+    logo: { fontSize:"13px", color:"#d4a84b", textTransform:"uppercase", letterSpacing:"2px", marginBottom:"28px", fontWeight:"700" },
+    title: { fontSize:"22px", fontWeight:"700", color:"#1a1a2e", marginBottom:"8px", lineHeight:"1.3" },
+    hint: { fontSize:"14px", color:"#888", marginBottom:"20px", fontStyle:"italic", lineHeight:"1.5" },
+    progress: { display:"flex", gap:"6px", marginBottom:"28px" },
+    dot: (a,d) => ({ width:"8px", height:"8px", borderRadius:"50%", background:d?"#1a1a2e":a?"#d4a84b":"#e5e5e5" }),
+    nav: { background:"#fff", borderBottom:"1px solid #e8e4df", display:"flex", alignItems:"center", padding:"0 28px", position:"sticky", top:0, zIndex:10 },
+    navLogo: { fontSize:"14px", fontWeight:"700", color:"#1a1a2e", marginRight:"20px", padding:"15px 0", letterSpacing:"0.5px" },
+    navBtn: (a) => ({ padding:"15px 16px", border:"none", background:"transparent", color:a?"#1a1a2e":"#bbb", fontFamily:"Georgia,serif", fontSize:"12px", fontWeight:a?"700":"400", cursor:"pointer", borderBottom:a?"2px solid #d4a84b":"2px solid transparent", letterSpacing:"0.8px", textTransform:"uppercase" }),
+    wrap: { maxWidth:"800px", margin:"0 auto", padding:"32px 20px" },
+    h1: { fontSize:"26px", fontWeight:"700", color:"#1a1a2e", margin:"0 0 6px" },
+    sub: { color:"#aaa", fontSize:"13px", margin:"0 0 24px", fontStyle:"italic" },
+    card: { background:"#fff", border:"1px solid #e8e4df", borderRadius:"12px", padding:"22px", marginBottom:"14px" },
+    label: { display:"block", color:"#aaa", fontSize:"11px", textTransform:"uppercase", letterSpacing:"1.2px", marginBottom:"7px" },
+    input: { width:"100%", background:"#fafafa", border:"1px solid #e0dbd4", borderRadius:"8px", padding:"11px 14px", color:"#1a1a1a", fontFamily:"Georgia,serif", fontSize:"14px", outline:"none", boxSizing:"border-box" },
+    textarea: { width:"100%", minHeight:"130px", background:"#fafafa", border:"1px solid #e0dbd4", borderRadius:"8px", padding:"11px 14px", color:"#1a1a1a", fontFamily:"Georgia,serif", fontSize:"14px", resize:"vertical", outline:"none", boxSizing:"border-box" },
+    btnDark: { background:"#1a1a2e", color:"#fff", border:"none", borderRadius:"8px", padding:"12px 26px", fontSize:"14px", fontWeight:"700", cursor:"pointer", fontFamily:"Georgia,serif" },
+    btnGold: { background:"#d4a84b", color:"#1a1a2e", border:"none", borderRadius:"8px", padding:"12px 26px", fontSize:"14px", fontWeight:"700", cursor:"pointer", fontFamily:"Georgia,serif" },
+    btnOutline: { background:"transparent", color:"#1a1a2e", border:"1px solid #1a1a2e", borderRadius:"8px", padding:"9px 18px", fontSize:"13px", cursor:"pointer", fontFamily:"Georgia,serif" },
+    btnGhost: { background:"transparent", color:"#bbb", border:"1px solid #e0dbd4", borderRadius:"7px", padding:"7px 12px", fontSize:"12px", cursor:"pointer", fontFamily:"Georgia,serif" },
+    tab: (a) => ({ padding:"9px 14px", borderRadius:"7px", border:"1px solid", borderColor:a?"#1a1a2e":"#e0dbd4", background:a?"#1a1a2e":"transparent", color:a?"#fff":"#aaa", fontWeight:a?"700":"400", fontSize:"12px", cursor:"pointer", fontFamily:"Georgia,serif" }),
+    scoreCard: (sc) => ({ background:"#fff", border:`2px solid ${scoreColor(sc)}`, borderRadius:"12px", padding:"18px 22px", marginBottom:"14px", display:"flex", alignItems:"center", gap:"20px" }),
+    flag: { background:"#fff5f5", border:"1px solid #fecaca", borderRadius:"8px", padding:"11px 14px", marginBottom:"12px", color:"#dc2626", fontSize:"13px", lineHeight:"1.6" },
+    trend: { background:"#f0fdf4", border:"1px solid #bbf7d0", borderRadius:"8px", padding:"11px 14px", marginBottom:"12px", color:"#166534", fontSize:"13px", lineHeight:"1.6" },
+    pre: { whiteSpace:"pre-wrap", fontFamily:"Georgia,serif", fontSize:"14px", color:"#1a1a1a", lineHeight:"1.85", margin:0 },
+    sel: (s) => ({ background:"#fff", border:`1px solid ${STATUS_COLORS[s]||"#e0dbd4"}`, borderRadius:"6px", padding:"4px 8px", color:STATUS_COLORS[s]||"#aaa", fontFamily:"Georgia,serif", fontSize:"12px", cursor:"pointer" }),
+    statCard: { background:"#fff", border:"1px solid #e8e4df", borderRadius:"10px", padding:"14px", textAlign:"center" },
+    errBox: { background:"#fff5f5", border:"1px solid #fecaca", borderRadius:"8px", padding:"11px 14px", marginBottom:"12px", color:"#dc2626", fontSize:"13px" },
+  };
+
+  if (screen==="loading") return <div style={{...C.page,display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{color:"#aaa",fontStyle:"italic"}}>Loading…</span></div>;
+
+  // ── API KEY SCREEN ──
+  if (screen==="apikey") return (
+    <div style={C.center}>
+      <div style={C.bigCard}>
+        <div style={C.logo}>✦ JobFit Analyser</div>
+        <div style={C.title}>Enter your Anthropic API key</div>
+        <div style={C.hint}>
+          You need a free API key to power the AI features.<br/><br/>
+          <strong>Get one free:</strong><br/>
+          1. Go to <strong>console.anthropic.com</strong><br/>
+          2. Sign up → API Keys → Create key<br/>
+          3. Paste it below<br/><br/>
+          Your key is saved only on your computer, never shared.
+        </div>
+        <input
+          style={{...C.input, fontFamily:"monospace", fontSize:"13px"}}
+          placeholder="sk-ant-api03-..."
+          value={apiKeyInput}
+          onChange={e=>setApiKeyInput(e.target.value)}
+          type="password"
+        />
+        {apiKeyError && <div style={{color:"#dc2626",fontSize:"13px",marginTop:"8px"}}>{apiKeyError}</div>}
+        <div style={{marginTop:"16px"}}>
+          <button style={C.btnGold} onClick={submitApiKey}>Continue →</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── ONBOARDING ──
+  if (screen==="onboarding") {
+    const step = ONBOARDING_STEPS[onboardStep];
+    const isLast = onboardStep===ONBOARDING_STEPS.length-1;
+    const canProceed = !step.required || profileDraft[step.key]?.trim().length>0;
+    return (
+      <div style={C.center}>
+        <div style={C.bigCard}>
+          <div style={C.logo}>✦ JobFit Analyser — Setup {onboardStep+1}/{ONBOARDING_STEPS.length}</div>
+          <div style={C.progress}>{ONBOARDING_STEPS.map((_,i)=><div key={i} style={C.dot(i===onboardStep,i<onboardStep)} />)}</div>
+          <div style={C.title}>{step.label}</div>
+          <div style={C.hint}>{step.hint}</div>
+          {step.type==="input"
+            ? <input style={{...C.input,fontSize:"15px"}} placeholder={step.placeholder} value={profileDraft[step.key]} onChange={e=>setProfileDraft(p=>({...p,[step.key]:e.target.value}))} autoFocus />
+            : <textarea style={{...C.textarea,minHeight:"140px"}} placeholder={step.placeholder} value={profileDraft[step.key]} onChange={e=>setProfileDraft(p=>({...p,[step.key]:e.target.value}))} autoFocus />
+          }
+          {!step.required && <div style={{fontSize:"12px",color:"#ccc",marginTop:"6px",fontStyle:"italic"}}>Optional — you can skip</div>}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:"22px"}}>
+            {onboardStep>0 ? <button style={C.btnGhost} onClick={()=>setOnboardStep(s=>s-1)}>← Back</button> : <div/>}
+            <div style={{display:"flex",gap:"10px"}}>
+              {!step.required && <button style={C.btnGhost} onClick={()=>isLast?completeOnboarding():setOnboardStep(s=>s+1)}>Skip</button>}
+              <button style={{...C.btnGold,opacity:canProceed?1:0.4}} disabled={!canProceed} onClick={()=>isLast?completeOnboarding():setOnboardStep(s=>s+1)}>
+                {isLast?"Start Analysing →":"Continue →"}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div style={{marginTop:"20px",fontSize:"12px",color:"#555",textAlign:"center"}}>Your data is saved only on this computer.</div>
+      </div>
+    );
+  }
+
+  // ── MAIN APP ──
+  return (
+    <div style={C.page}>
+      <div style={C.nav}>
+        <span style={C.navLogo}>✦ JobFit</span>
+        {[["analyze","Analyse"],["history","History"],["settings","My Profile"]].map(([v,l])=>(
+          <button key={v} style={C.navBtn(view===v)} onClick={()=>setView(v)}>{l}</button>
+        ))}
+        <div style={{marginLeft:"auto",fontSize:"13px",color:"#bbb",fontStyle:"italic",padding:"0 4px"}}>
+          {profile.name&&`Hi, ${profile.name.split(" ")[0]}`}
+        </div>
+      </div>
+
+      <div style={C.wrap}>
+
+        {view==="analyze" && <>
+          <h1 style={C.h1}>Job Fit Analyser</h1>
+          <p style={C.sub}>Paste any job description — get an honest assessment, tailored CV, cover letter & LinkedIn message</p>
+          <div style={C.card}>
+            <label style={C.label}>Job Description</label>
+            <textarea style={{...C.textarea,minHeight:"160px"}} placeholder="Paste the full job description here — include job title, responsibilities, requirements, and company name for best results..." value={jobText} onChange={e=>setJobText(e.target.value)} />
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:"14px"}}>
+              <span style={{fontSize:"12px",color:"#bbb",fontStyle:"italic"}}>{loading?loadingMsg:"Assessed against your CV, interests, goals & constraints"}</span>
+              <button style={{...C.btnDark,opacity:loading||!jobText.trim()?0.4:1}} onClick={analyze} disabled={loading||!jobText.trim()}>{loading?"Working…":"Analyse →"}</button>
+            </div>
+          </div>
+
+          {error && <div style={C.errBox}>⚠ {error}</div>}
+
+          {results && <>
+            <div style={C.scoreCard(score)}>
+              <div style={{textAlign:"center",minWidth:"68px"}}>
+                <div style={{fontSize:"50px",fontWeight:"700",color:scoreColor(score),lineHeight:1}}>{score}</div>
+                <div style={{fontSize:"10px",color:"#bbb",marginTop:"2px",letterSpacing:"1.2px",textTransform:"uppercase"}}>Fit Score</div>
+              </div>
+              <div>
+                <div style={{fontSize:"19px",fontWeight:"700",color:"#1a1a2e"}}>{verdict}</div>
+                <div style={{fontSize:"13px",color:"#aaa",marginTop:"3px",fontStyle:"italic"}}>{results.roleTitle} · {results.company}</div>
+              </div>
+            </div>
+
+            {redFlags&&redFlags.toLowerCase()!=="none"&&<div style={C.flag}><strong>🚩 Red Flag:</strong> {redFlags}</div>}
+            {marketTrend&&<div style={C.trend}><strong>📈 3-Year Market Outlook:</strong> {marketTrend}</div>}
+
+            <div style={{display:"flex",gap:"8px",marginBottom:"14px",flexWrap:"wrap"}}>
+              {[["assessment","📊 Assessment"],["cv","📄 CV"],["cover","✉️ Cover Letter"],["linkedin","💼 LinkedIn"]].map(([id,label])=>(
+                <button key={id} style={C.tab(activeTab===id)} onClick={()=>{
+                  setActiveTab(id);
+                  if(id==="cv"&&!results.cv) generateCV();
+                  if(id==="cover"&&!results.cover) generateCover();
+                  if(id==="linkedin"&&!results.linkedin) generateLinkedIn();
+                }}>{label}</button>
+              ))}
+            </div>
+
+            <div style={C.card}>
+              {activeTab==="assessment"&&<><h3 style={{color:"#1a1a2e",marginTop:0,fontSize:"15px",marginBottom:"14px"}}>Full Assessment</h3><pre style={C.pre}>{cleanAssessment}</pre></>}
+              {activeTab==="cv"&&(loading&&loadingMsg.includes("CV")?<div style={{textAlign:"center",padding:"40px",color:"#bbb",fontStyle:"italic"}}>{loadingMsg}</div>:results.cv?<>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px"}}>
+                  <h3 style={{color:"#1a1a2e",margin:0,fontSize:"15px"}}>Tailored CV</h3>
+                  <div style={{display:"flex",gap:"8px"}}>
+                    <button style={C.btnGhost} onClick={()=>navigator.clipboard.writeText(results.cv)}>📋 Copy</button>
+                    <button style={C.btnOutline} onClick={()=>exportToWord(results.cv,results.roleTitle,profile.name)}>⬇ Word</button>
+                  </div>
+                </div>
+                <pre style={C.pre}>{results.cv}</pre>
+              </>:<div style={{textAlign:"center",padding:"40px",color:"#bbb",fontStyle:"italic"}}>Generating…</div>)}
+              {activeTab==="cover"&&(loading&&loadingMsg.includes("cover")?<div style={{textAlign:"center",padding:"40px",color:"#bbb",fontStyle:"italic"}}>{loadingMsg}</div>:results.cover?<>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px"}}>
+                  <h3 style={{color:"#1a1a2e",margin:0,fontSize:"15px"}}>Cover Letter</h3>
+                  <button style={C.btnGhost} onClick={()=>navigator.clipboard.writeText(results.cover)}>📋 Copy</button>
+                </div>
+                <pre style={C.pre}>{results.cover}</pre>
+              </>:<div style={{textAlign:"center",padding:"40px",color:"#bbb",fontStyle:"italic"}}>Generating…</div>)}
+              {activeTab==="linkedin"&&(loading&&loadingMsg.includes("LinkedIn")?<div style={{textAlign:"center",padding:"40px",color:"#bbb",fontStyle:"italic"}}>{loadingMsg}</div>:results.linkedin?<>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px"}}>
+                  <h3 style={{color:"#1a1a2e",margin:0,fontSize:"15px"}}>LinkedIn Outreach</h3>
+                  <button style={C.btnGhost} onClick={()=>navigator.clipboard.writeText(results.linkedin)}>📋 Copy</button>
+                </div>
+                <div style={{background:"#f9f7f4",borderRadius:"8px",padding:"20px",borderLeft:"3px solid #d4a84b",fontSize:"15px",lineHeight:"1.8",fontStyle:"italic"}}>{results.linkedin}</div>
+              </>:<div style={{textAlign:"center",padding:"40px",color:"#bbb",fontStyle:"italic"}}>Generating…</div>)}
+            </div>
+            <div style={{textAlign:"center"}}><button style={C.btnGhost} onClick={()=>{setResults(null);setJobText("");}}>← Analyse another role</button></div>
+          </>}
+        </>}
+
+        {view==="history"&&<>
+          <h1 style={C.h1}>Application History</h1>
+          <p style={C.sub}>Track every role — spot what the market sees as your fit</p>
+          {history.length===0
+            ?<div style={{...C.card,textAlign:"center",padding:"50px",color:"#bbb",fontStyle:"italic"}}>No history yet. Analyse a job to get started.</div>
+            :<>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"10px",marginBottom:"18px"}}>
+                {[["Total",history.length],["Avg Score",Math.round(history.reduce((a,h)=>a+(h.score||0),0)/history.length)],["Good Fits",history.filter(h=>h.score>=65).length],["Interviews",history.filter(h=>["Interview","Final Round","Offer"].includes(h.status)).length]].map(([l,v])=>(
+                  <div key={l} style={C.statCard}><div style={{fontSize:"24px",fontWeight:"700",color:"#d4a84b"}}>{v}</div><div style={{fontSize:"11px",color:"#aaa",marginTop:"3px",textTransform:"uppercase",letterSpacing:"0.8px"}}>{l}</div></div>
+                ))}
+              </div>
+              <div style={C.card}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 55px 105px 125px 32px",gap:"8px",paddingBottom:"10px",borderBottom:"1px solid #f0ece6",marginBottom:"4px"}}>
+                  {["Role","Score","Verdict","Status",""].map(h=><div key={h} style={{fontSize:"10px",color:"#ccc",textTransform:"uppercase",letterSpacing:"1px"}}>{h}</div>)}
+                </div>
+                {history.map(item=>(
+                  <div key={item.id} style={{display:"grid",gridTemplateColumns:"1fr 55px 105px 125px 32px",gap:"8px",alignItems:"center",padding:"11px 0",borderBottom:"1px solid #f9f7f4"}}>
+                    <div><div style={{fontSize:"13px",color:"#1a1a2e",fontWeight:"600"}}>{item.roleTitle}</div><div style={{fontSize:"11px",color:"#bbb",marginTop:"2px"}}>{item.company} · {item.date}</div></div>
+                    <div style={{fontSize:"19px",fontWeight:"700",color:scoreColor(item.score)}}>{item.score}</div>
+                    <div style={{fontSize:"11px",color:"#aaa",fontStyle:"italic",lineHeight:"1.4"}}>{item.verdict}</div>
+                    <select style={C.sel(item.status)} value={item.status} onChange={e=>updateStatus(item.id,e.target.value)}>{INTERVIEW_STATUSES.map(st=><option key={st} value={st}>{st}</option>)}</select>
+                    <button style={{...C.btnGhost,padding:"3px 6px",color:"#ddd"}} onClick={()=>deleteItem(item.id)}>✕</button>
+                  </div>
+                ))}
+              </div>
+            </>}
+        </>}
+
+        {view==="settings"&&<>
+          <h1 style={C.h1}>My Profile</h1>
+          <p style={C.sub}>Edit your CV, interests, goals and constraints — every analysis uses this</p>
+          {[["name","Your name","input","e.g. Sarah"],["cv","CV / Work history","textarea","Job titles, companies, dates, achievements..."],["interests","What energises you","textarea","Work that you enjoy and thrive in..."],["dislikes","What drains you","textarea","Work that doesn't suit you..."],["goals","Long-term goals","textarea","Where you want to be in 3–5 years..."],["constraints","Constraints & red flags","textarea","Visa requirements, sectors to avoid..."]].map(([key,label,type,ph])=>(
+            <div key={key} style={{...C.card,marginBottom:"10px"}}>
+              <label style={C.label}>{label}</label>
+              {type==="input"?<input style={C.input} placeholder={ph} value={profileDraft[key]} onChange={e=>setProfileDraft(p=>({...p,[key]:e.target.value}))} />:<textarea style={{...C.textarea,minHeight:"90px"}} placeholder={ph} value={profileDraft[key]} onChange={e=>setProfileDraft(p=>({...p,[key]:e.target.value}))} />}
+            </div>
+          ))}
+          <div style={{display:"flex",gap:"12px",alignItems:"center"}}>
+            <button style={C.btnDark} onClick={saveProfile}>Save Profile</button>
+            <button style={C.btnGhost} onClick={()=>{setApiKey("");localStorage.removeItem("jfa_apikey");localStorage.removeItem("jfa_profile");setScreen("apikey");}}>Reset Everything</button>
+            {profileSaved&&<span style={{color:"#10b981",fontSize:"13px"}}>✓ Saved</span>}
+          </div>
+        </>}
+
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>

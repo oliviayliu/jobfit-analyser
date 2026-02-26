@@ -1,8 +1,8 @@
 # 🎯 JobFit Analyser
 
-An AI-powered job fit analyser that gives you an honest assessment of any job — plus a tailored CV, cover letter, and LinkedIn outreach message — all based on your personal profile, interests, and career goals.
+An AI-powered job fit analyser that gives you an honest assessment of any job, plus a tailored CV, cover letter, and LinkedIn outreach message - ALL based on your personal profile, interests, and career goals.
 
-Built by [Olivia Y. Liu](https://www.linkedin.com/in/oliviayliu/) · Powered by Claude (Anthropic)
+Built by [Olivia Y. Liu](https://www.linkedin.com/in/oliviayliu/) · Powered by Claude
 
 ---
 
@@ -102,7 +102,7 @@ You can edit this anytime in the **My Profile** tab.
 ## Tech stack
 
 - React 18
-- Anthropic Claude API (`claude-sonnet-4-20250514`)
+- Anthropic Claude API
 - No backend required
 - localStorage for persistence
 
